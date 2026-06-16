@@ -2,18 +2,14 @@ package com.fazza.pdfeditor.data.repository
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
 import com.fazza.pdfeditor.data.db.AnnotationDao
 import com.fazza.pdfeditor.data.db.RecentFileDao
 import com.fazza.pdfeditor.data.model.Annotation
 import com.fazza.pdfeditor.data.model.RecentFile
-import com.tom_roush.pdfbox.pdmodel.PDDocument
-import com.tom_roush.pdfbox.pdmodel.PDPage
-import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
-import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
-import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
-import com.tom_roush.pdfbox.util.PDFBoxResourceLoader
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -28,220 +24,146 @@ class PdfRepository @Inject constructor(
     private val recentFileDao: RecentFileDao,
     private val annotationDao: AnnotationDao
 ) {
-    init {
-        PDFBoxResourceLoader.init(context)
-    }
 
-    // ─── Recent Files ────────────────────────────────────────────────────────
+    // ── Recent Files ──────────────────────────────────────────────────────────
 
     fun getRecentFiles(): Flow<List<RecentFile>> = recentFileDao.getAllRecentFiles()
 
     suspend fun addRecentFile(filePath: String) = withContext(Dispatchers.IO) {
         val file = File(filePath)
         if (!file.exists()) return@withContext
-        val pageCount = getPageCount(filePath)
-        val recent = RecentFile(
-            filePath = filePath,
-            fileName = file.name,
-            fileSize = file.length(),
-            pageCount = pageCount,
-            lastOpenedAt = System.currentTimeMillis()
+        recentFileDao.insert(
+            RecentFile(
+                filePath = filePath,
+                fileName = file.name,
+                fileSize = file.length(),
+                pageCount = getPageCount(filePath),
+                lastOpenedAt = System.currentTimeMillis()
+            )
         )
-        recentFileDao.insert(recent)
     }
 
-    suspend fun removeRecentFile(filePath: String) {
-        recentFileDao.deleteByPath(filePath)
-    }
+    suspend fun removeRecentFile(filePath: String) = recentFileDao.deleteByPath(filePath)
 
-    // ─── Page Count ──────────────────────────────────────────────────────────
+    // ── Page Count & Render ───────────────────────────────────────────────────
 
     suspend fun getPageCount(filePath: String): Int = withContext(Dispatchers.IO) {
         try {
             val fd = ParcelFileDescriptor.open(File(filePath), ParcelFileDescriptor.MODE_READ_ONLY)
             val renderer = PdfRenderer(fd)
             val count = renderer.pageCount
-            renderer.close()
-            fd.close()
+            renderer.close(); fd.close()
             count
-        } catch (e: Exception) {
-            0
-        }
+        } catch (e: Exception) { 0 }
     }
 
-    // ─── Page Rendering ──────────────────────────────────────────────────────
-
     suspend fun renderPage(
-        filePath: String,
-        pageIndex: Int,
-        width: Int,
-        height: Int
+        filePath: String, pageIndex: Int, width: Int, height: Int
     ): Bitmap? = withContext(Dispatchers.IO) {
         try {
             val fd = ParcelFileDescriptor.open(File(filePath), ParcelFileDescriptor.MODE_READ_ONLY)
             val renderer = PdfRenderer(fd)
-            if (pageIndex >= renderer.pageCount) {
-                renderer.close(); fd.close()
-                return@withContext null
-            }
+            if (pageIndex >= renderer.pageCount) { renderer.close(); fd.close(); return@withContext null }
             val page = renderer.openPage(pageIndex)
             val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-            bitmap.eraseColor(android.graphics.Color.WHITE)
+            bitmap.eraseColor(Color.WHITE)
             page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-            page.close()
-            renderer.close()
-            fd.close()
+            page.close(); renderer.close(); fd.close()
             bitmap
-        } catch (e: Exception) {
-            null
-        }
+        } catch (e: Exception) { null }
     }
 
-    // ─── Merge PDFs ───────────────────────────────────────────────────────────
+    // ── Merge PDFs ────────────────────────────────────────────────────────────
 
     suspend fun mergePdfs(inputPaths: List<String>, outputPath: String): Result<String> =
         withContext(Dispatchers.IO) {
             try {
-                val outputDoc = PDDocument()
-                inputPaths.forEach { path ->
-                    val doc = PDDocument.load(File(path))
-                    doc.pages.forEach { page ->
-                        outputDoc.addPage(page)
+                val outDoc = PdfDocument()
+                var pageNum = 1
+
+                for (path in inputPaths) {
+                    val fd = ParcelFileDescriptor.open(File(path), ParcelFileDescriptor.MODE_READ_ONLY)
+                    val renderer = PdfRenderer(fd)
+                    for (i in 0 until renderer.pageCount) {
+                        val srcPage = renderer.openPage(i)
+                        val w = srcPage.width
+                        val h = srcPage.height
+                        val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                        bitmap.eraseColor(Color.WHITE)
+                        srcPage.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+                        srcPage.close()
+
+                        val pageInfo = PdfDocument.PageInfo.Builder(w, h, pageNum++).create()
+                        val outPage = outDoc.startPage(pageInfo)
+                        outPage.canvas.drawBitmap(bitmap, 0f, 0f, null)
+                        bitmap.recycle()
+                        outDoc.finishPage(outPage)
                     }
-                    doc.close()
+                    renderer.close(); fd.close()
                 }
-                outputDoc.save(outputPath)
-                outputDoc.close()
+
+                File(outputPath).outputStream().use { outDoc.writeTo(it) }
+                outDoc.close()
                 Result.success(outputPath)
             } catch (e: Exception) {
                 Result.failure(e)
             }
         }
 
-    // ─── Split PDF ────────────────────────────────────────────────────────────
+    // ── Split PDF ─────────────────────────────────────────────────────────────
 
     suspend fun splitPdf(
-        inputPath: String,
-        fromPage: Int,
-        toPage: Int,
-        outputPath: String
+        inputPath: String, fromPage: Int, toPage: Int, outputPath: String
     ): Result<String> = withContext(Dispatchers.IO) {
         try {
-            val doc = PDDocument.load(File(inputPath))
-            val outputDoc = PDDocument()
-            val lastPage = minOf(toPage - 1, doc.numberOfPages - 1)
-            for (i in fromPage - 1..lastPage) {
-                outputDoc.addPage(doc.pages[i])
+            val outDoc = PdfDocument()
+            val fd = ParcelFileDescriptor.open(File(inputPath), ParcelFileDescriptor.MODE_READ_ONLY)
+            val renderer = PdfRenderer(fd)
+
+            val last = minOf(toPage - 1, renderer.pageCount - 1)
+            var pageNum = 1
+            for (i in (fromPage - 1)..last) {
+                val srcPage = renderer.openPage(i)
+                val w = srcPage.width
+                val h = srcPage.height
+                val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                bitmap.eraseColor(Color.WHITE)
+                srcPage.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+                srcPage.close()
+
+                val pageInfo = PdfDocument.PageInfo.Builder(w, h, pageNum++).create()
+                val outPage = outDoc.startPage(pageInfo)
+                outPage.canvas.drawBitmap(bitmap, 0f, 0f, null)
+                bitmap.recycle()
+                outDoc.finishPage(outPage)
             }
-            outputDoc.save(outputPath)
-            outputDoc.close()
-            doc.close()
+
+            renderer.close(); fd.close()
+            File(outputPath).outputStream().use { outDoc.writeTo(it) }
+            outDoc.close()
             Result.success(outputPath)
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    // ─── Add Text to PDF ─────────────────────────────────────────────────────
+    // ── Add Text (coming soon) ────────────────────────────────────────────────
 
     suspend fun addTextToPdf(
-        inputPath: String,
-        pageIndex: Int,
-        text: String,
-        x: Float,
-        y: Float,
-        fontSize: Float = 12f,
-        outputPath: String
-    ): Result<String> = withContext(Dispatchers.IO) {
-        try {
-            val doc = PDDocument.load(File(inputPath))
-            val page = doc.pages[pageIndex]
-            val contentStream = PDPageContentStream(
-                doc, page, PDPageContentStream.AppendMode.APPEND, true, true
-            )
-            contentStream.beginText()
-            contentStream.setFont(PDType1Font.HELVETICA, fontSize)
-            contentStream.newLineAtOffset(x, page.mediaBox.height - y)
-            contentStream.showText(text)
-            contentStream.endText()
-            contentStream.close()
-            doc.save(outputPath)
-            doc.close()
-            Result.success(outputPath)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
+        inputPath: String, pageIndex: Int, text: String,
+        x: Float, y: Float, fontSize: Float, outputPath: String
+    ): Result<String> = Result.failure(Exception("Text editing coming soon!"))
 
-    // ─── Annotations ─────────────────────────────────────────────────────────
+    // ── Annotations ───────────────────────────────────────────────────────────
 
     fun getAnnotationsForPdf(pdfPath: String): Flow<List<Annotation>> =
         annotationDao.getAnnotationsForPdf(pdfPath)
 
-    suspend fun saveAnnotation(annotation: Annotation): Long =
-        annotationDao.insert(annotation)
-
-    suspend fun deleteAnnotation(annotation: Annotation) =
-        annotationDao.delete(annotation)
-
-    suspend fun clearAnnotations(pdfPath: String) =
-        annotationDao.deleteAllForPdf(pdfPath)
-
-    // ─── Export annotated PDF ─────────────────────────────────────────────────
+    suspend fun saveAnnotation(annotation: Annotation): Long = annotationDao.insert(annotation)
+    suspend fun deleteAnnotation(annotation: Annotation) = annotationDao.delete(annotation)
+    suspend fun clearAnnotations(pdfPath: String) = annotationDao.deleteAllForPdf(pdfPath)
 
     suspend fun exportAnnotatedPdf(
-        inputPath: String,
-        annotations: List<Annotation>,
-        outputPath: String
-    ): Result<String> = withContext(Dispatchers.IO) {
-        try {
-            val doc = PDDocument.load(File(inputPath))
-            annotations.groupBy { it.pageIndex }.forEach { (pageIdx, pageAnnotations) ->
-                if (pageIdx < doc.numberOfPages) {
-                    val page = doc.pages[pageIdx]
-                    val cs = PDPageContentStream(
-                        doc, page, PDPageContentStream.AppendMode.APPEND, true, true
-                    )
-                    pageAnnotations.forEach { ann ->
-                        val color = android.graphics.Color.valueOf(ann.color.toInt())
-                        cs.setNonStrokingColor(
-                            color.red(), color.green(), color.blue()
-                        )
-                        when (ann.type) {
-                            "HIGHLIGHT" -> {
-                                cs.setGraphicsStateParameters(
-                                    com.tom_roush.pdfbox.pdmodel.graphics.state.PDExtendedGraphicsState().apply {
-                                        nonStrokingAlphaConstant = 0.4f
-                                    }
-                                )
-                                cs.addRect(ann.x, page.mediaBox.height - ann.y - ann.height,
-                                    ann.width, ann.height)
-                                cs.fill()
-                            }
-                            "UNDERLINE" -> {
-                                cs.setStrokingColor(color.red(), color.green(), color.blue())
-                                cs.setLineWidth(1.5f)
-                                cs.moveTo(ann.x, page.mediaBox.height - ann.y - ann.height)
-                                cs.lineTo(ann.x + ann.width, page.mediaBox.height - ann.y - ann.height)
-                                cs.stroke()
-                            }
-                            "TEXT" -> {
-                                cs.beginText()
-                                cs.setFont(PDType1Font.HELVETICA, 12f)
-                                cs.newLineAtOffset(ann.x, page.mediaBox.height - ann.y)
-                                cs.showText(ann.text ?: "")
-                                cs.endText()
-                            }
-                        }
-                    }
-                    cs.close()
-                }
-            }
-            doc.save(outputPath)
-            doc.close()
-            Result.success(outputPath)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
+        inputPath: String, annotations: List<Annotation>, outputPath: String
+    ): Result<String> = Result.failure(Exception("Export coming soon!"))
 }
